@@ -2,15 +2,30 @@
 
 The database is the single source of truth.  Every mutation runs in an explicit
 ``BEGIN IMMEDIATE`` transaction so that a failed save leaves the previous state
-(notably the withdrawal register) intact.
+(notably the withdrawal register and the prepared supply data) intact.
+
+Besides the raw catalogue, the database holds *prepared supply data*:
+
+* ``export_preps`` marks one row per publication whose selection has been
+  precomputed, together with the highest withdrawal id visible at preparation
+  time.  Publications written by older releases simply lack a row and are
+  prepared lazily on their first download (see :func:`prepare_export`).
+* ``export_selection`` stores, per entry, only the archive numbers of the
+  selected (first complete) evidence group in registration order.  Downloads
+  therefore read just the selected groups and never touch the unused backup
+  groups.  A withdrawal only re-checks entries whose selected group contains
+  the withdrawn archive number.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(APP_ROOT), "data", "archive.sqlite3")
@@ -53,6 +68,33 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     archive_no    TEXT NOT NULL UNIQUE,
     withdrawn_at  TEXT NOT NULL
 );
+
+-- Prepared supply data: one row per publication that can be served from
+-- export_selection without scanning the backup evidence groups.
+CREATE TABLE IF NOT EXISTS export_preps (
+    publish_no   TEXT PRIMARY KEY REFERENCES publications(publish_no) ON DELETE CASCADE,
+    cutoff_id    INTEGER NOT NULL,      -- MAX(withdrawals.id) when prepared
+    prepared_at  TEXT NOT NULL
+);
+
+-- The selected evidence group of each entry, flattened in registration order.
+-- Entries without a complete group have no rows here and are omitted from
+-- downloads.  Only these rows are read when a prepared publication is served.
+CREATE TABLE IF NOT EXISTS export_selection (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_no    TEXT NOT NULL REFERENCES publications(publish_no) ON DELETE CASCADE,
+    entry_id      INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    group_no      INTEGER NOT NULL,     -- selected group, 1-based registration order
+    pos           INTEGER NOT NULL,     -- position inside the selected group
+    archive_no    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_selection_pub_entry
+    ON export_selection(publish_no, entry_id, pos);
+
+-- Supports the targeted withdrawal look-up: which selected groups cite a number.
+CREATE INDEX IF NOT EXISTS idx_selection_archive
+    ON export_selection(publish_no, archive_no);
 """
 
 
@@ -134,9 +176,50 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
+def _max_withdrawal_id(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM withdrawals").fetchone()[0]
+
+
+def _first_complete_group(
+    conn: sqlite3.Connection, entry_id: int, withdrawn: set[str]
+) -> tuple[int, list[str]] | None:
+    """Return ``(group_no, archive_numbers)`` for the entry's first complete
+    group in registration order, or ``None`` when every group cites a withdrawn
+    archive number.  A group is skipped as soon as one of its numbers is in the
+    withdrawal register visible to this transaction.
+    """
+    rows = conn.execute(
+        "SELECT group_no, pos, archive_no FROM evidence "
+        "WHERE entry_id = ? ORDER BY group_no, pos",
+        (entry_id,),
+    ).fetchall()
+
+    group_no: int | None = None
+    numbers: list[str] = []
+    complete = True
+    for row in rows:
+        if group_no is None or row["group_no"] != group_no:
+            if group_no is not None and complete:
+                return group_no, numbers
+            group_no = row["group_no"]
+            numbers = [row["archive_no"]]
+            complete = row["archive_no"] not in withdrawn
+        else:
+            numbers.append(row["archive_no"])
+            if row["archive_no"] in withdrawn:
+                complete = False
+    if group_no is not None and complete:
+        return group_no, numbers
+    return None
+
+
 def publish(rows: list[dict], publish_no: str, source_name: str | None = None) -> None:
     """Store a whole submission atomically, after checking every row has a
     complete evidence group under the withdrawals visible in this transaction.
+
+    The prepared supply data (selected group per row) is written in the same
+    transaction, so the first download is served straight from
+    ``export_selection`` without ever scanning the backup evidence groups.
 
     Raises :class:`IncompleteEvidence` or :class:`DuplicatePublication` without
     writing anything.
@@ -164,6 +247,7 @@ def publish(rows: list[dict], publish_no: str, source_name: str | None = None) -
                 "INSERT INTO publications (publish_no, source_name, created_at) VALUES (?, ?, ?)",
                 (publish_no, source_name, _now()),
             )
+            selection_payload: list[tuple] = []
             for row in rows:
                 cur = conn.execute(
                     "INSERT INTO entries (publish_no, line_no, old_name, new_name) "
@@ -171,23 +255,102 @@ def publish(rows: list[dict], publish_no: str, source_name: str | None = None) -
                     (publish_no, row["line_no"], row["old_name"], row["new_name"]),
                 )
                 entry_id = cur.lastrowid
-                payload = []
+                evidence_payload = []
                 for g_idx, group in enumerate(row["evidence"], start=1):
                     for p_idx, archive_no in enumerate(group):
-                        payload.append((entry_id, g_idx, p_idx, archive_no))
+                        evidence_payload.append((entry_id, g_idx, p_idx, archive_no))
                 conn.executemany(
                     "INSERT INTO evidence (entry_id, group_no, pos, archive_no) "
                     "VALUES (?, ?, ?, ?)",
-                    payload,
+                    evidence_payload,
                 )
+                # Validation above guarantees a complete group exists; pick the
+                # first one in registration order (the same rule the CSV uses).
+                chosen_group_no, chosen = next(
+                    (idx, group)
+                    for idx, group in enumerate(row["evidence"], start=1)
+                    if all(no not in withdrawn for no in group)
+                )
+                for pos, archive_no in enumerate(chosen):
+                    selection_payload.append(
+                        (publish_no, entry_id, chosen_group_no, pos, archive_no)
+                    )
+
+            conn.execute(
+                "INSERT INTO export_preps (publish_no, cutoff_id, prepared_at) "
+                "VALUES (?, ?, ?)",
+                (publish_no, _max_withdrawal_id(conn), _now()),
+            )
+            conn.executemany(
+                "INSERT INTO export_selection "
+                "(publish_no, entry_id, group_no, pos, archive_no) "
+                "VALUES (?, ?, ?, ?, ?)",
+                selection_payload,
+            )
+
+
+def _refresh_preps_after_withdrawal(
+    conn: sqlite3.Connection, archive_no: str
+) -> None:
+    """Recompute prepared selections after a newly registered withdrawal.
+
+    Only entries whose *currently selected* group cites ``archive_no`` are
+    re-checked.  Each one moves to the first complete group in registration
+    order (any group citing a withdrawn number is skipped), or loses its
+    selection entirely when no complete group remains.  Runs inside the
+    caller's transaction, so registration and supply changes commit together.
+    """
+    withdrawn = withdrawn_numbers(conn)
+    cutoff_id = _max_withdrawal_id(conn)
+    preps = conn.execute(
+        "SELECT publish_no FROM export_preps"
+    ).fetchall()
+
+    for prep in preps:
+        publish_no = prep["publish_no"]
+        affected = conn.execute(
+            "SELECT DISTINCT entry_id FROM export_selection "
+            "WHERE publish_no = ? AND archive_no = ?",
+            (publish_no, archive_no),
+        ).fetchall()
+        if not affected:
+            continue
+
+        new_selection: list[tuple] = []
+        for item in affected:
+            entry_id = item["entry_id"]
+            chosen = _first_complete_group(conn, entry_id, withdrawn)
+            conn.execute(
+                "DELETE FROM export_selection WHERE entry_id = ?", (entry_id,)
+            )
+            if chosen is None:
+                continue  # no complete group left: the row is omitted later
+            group_no, numbers = chosen
+            for pos, number in enumerate(numbers):
+                new_selection.append(
+                    (publish_no, entry_id, group_no, pos, number)
+                )
+        if new_selection:
+            conn.executemany(
+                "INSERT INTO export_selection "
+                "(publish_no, entry_id, group_no, pos, archive_no) "
+                "VALUES (?, ?, ?, ?, ?)",
+                new_selection,
+            )
+        conn.execute(
+            "UPDATE export_preps SET cutoff_id = ? WHERE publish_no = ?",
+            (cutoff_id, publish_no),
+        )
 
 
 def withdraw(archive_no: str) -> bool:
-    """Register a withdrawal, idempotently.
+    """Register a withdrawal, idempotently, and refresh affected supply data.
 
-    Returns ``True`` only when a new withdrawal row was created.  Any database
-    error rolls the transaction back, so the previously effective withdrawal
-    state is kept unchanged.
+    The withdrawal row and every affected publication's selection changes are
+    written in one transaction.  Any database error rolls the whole
+    transaction back, so the previously effective withdrawal state and supply
+    data are kept unchanged.  Returns ``True`` only for a newly created
+    withdrawal row.
     """
     with get_conn() as conn:
         with _write_tx(conn):
@@ -196,7 +359,76 @@ def withdraw(archive_no: str) -> bool:
                 "ON CONFLICT(archive_no) DO NOTHING",
                 (archive_no, _now()),
             )
-            return cur.rowcount > 0
+            created = cur.rowcount > 0
+            if created:
+                _refresh_preps_after_withdrawal(conn, archive_no)
+            return created
+
+
+def prepare_export(publish_no: str) -> bool:
+    """Build prepared supply data for a legacy publication on first download.
+
+    Older publications have no ``export_preps`` row.  The first download calls
+    this to organize the selected groups once; the result is persisted, so
+    later downloads (and process restarts) reuse it.  Returns ``False``
+    without raising when preparation fails -- the caller then serves the file
+    with the original rule-based download.
+    """
+    try:
+        with get_conn() as conn:
+            with _write_tx(conn):
+                if conn.execute(
+                    "SELECT 1 FROM export_preps WHERE publish_no = ?",
+                    (publish_no,),
+                ).fetchone():
+                    return True
+                if conn.execute(
+                    "SELECT 1 FROM publications WHERE publish_no = ?",
+                    (publish_no,),
+                ).fetchone() is None:
+                    return False
+
+                withdrawn = withdrawn_numbers(conn)
+                cutoff_id = _max_withdrawal_id(conn)
+                after_id = 0
+                selection_payload: list[tuple] = []
+                while True:
+                    entries = conn.execute(
+                        "SELECT id FROM entries "
+                        "WHERE publish_no = ? AND id > ? ORDER BY id LIMIT ?",
+                        (publish_no, after_id, 200),
+                    ).fetchall()
+                    if not entries:
+                        break
+                    for entry in entries:
+                        chosen = _first_complete_group(conn, entry["id"], withdrawn)
+                        if chosen is None:
+                            continue
+                        group_no, numbers = chosen
+                        for pos, number in enumerate(numbers):
+                            selection_payload.append(
+                                (publish_no, entry["id"], group_no, pos, number)
+                            )
+                    after_id = entries[-1]["id"]
+
+                conn.execute(
+                    "INSERT INTO export_preps (publish_no, cutoff_id, prepared_at) "
+                    "VALUES (?, ?, ?)",
+                    (publish_no, cutoff_id, _now()),
+                )
+                if selection_payload:
+                    conn.executemany(
+                        "INSERT INTO export_selection "
+                        "(publish_no, entry_id, group_no, pos, archive_no) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        selection_payload,
+                    )
+        return True
+    except Exception:
+        logger.exception(
+            "为旧版发布 %s 准备供数数据失败，本次改用原规则下载", publish_no
+        )
+        return False
 
 
 def publication_exists(publish_no: str, path: str | None = None) -> bool:
