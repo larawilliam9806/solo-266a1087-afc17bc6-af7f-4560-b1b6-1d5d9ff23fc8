@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>旧版地名对照表供数</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>旧版地名对照表供数</h1>
+  <p class="sub">编目员登记发布号与依据档号，读者按发布号下载 CSV。</p>
+</header>
+
+{% if message %}
+  <ul class="flash">
+    <li class="{{ message_category or 'info' }}">{{ message }}</li>
+  </ul>
+{% endif %}
+
+<main>
+  <section class="card">
+    <h2>编目：上传对照表</h2>
+    <form method="post" action="{{ url_for('main.catalog_publish') }}" enctype="multipart/form-data">
+      <label>发布号 <input type="text" name="publish_no" placeholder="留空则取 JSON 中的 publish_no"></label>
+      <label>来源名称 <input type="text" name="source_name" placeholder="可选"></label>
+      <label>JSON 文件 <input type="file" name="json_file" accept=".json,application/json"></label>
+      <label>或粘贴 JSON
+        <textarea name="payload" rows="10" spellcheck="false" placeholder='{
+  "publish_no": "GZ-2026-001",
+  "rows": [
+    {"line_no": "1", "old_name": "北平", "new_name": "北京",
+     "evidence": [["A-001", "A-002"], ["B-010"]]}
+  ]
+}'></textarea>
+      </label>
+      <button type="submit">提交发布</button>
+      <p class="hint">每行依据档号可给一组或多组。组内档号均未撤档才算完整；任一行没有完整组则整批退回。发布号全局唯一。</p>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>编目：按档号撤档</h2>
+    <form method="post" action="{{ url_for('main.catalog_withdraw') }}">
+      <label>档号 <input type="text" name="archive_no" required placeholder="例如 A-002"></label>
+      <button type="submit">撤档</button>
+      <p class="hint">同一档号重复撤档只记一次。撤档对后续下载即时生效，已开始的下载不受影响。</p>
+    </form>
+    <details>
+      <summary>已撤档档号（{{ withdrawals|length }}）</summary>
+      {% if withdrawals %}
+        <table class="list">
+          <thead><tr><th>档号</th><th>登记时间（UTC）</th></tr></thead>
+          <tbody>
+          {% for w in withdrawals %}
+            <tr><td>{{ w['archive_no'] }}</td><td>{{ w['withdrawn_at'] }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="muted">暂无撤档记录。</p>
+      {% endif %}
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>读者：按发布号下载</h2>
+    {% if publications %}
+      <table class="list">
+        <thead>
+          <tr><th>发布号</th><th>来源</th><th>行数</th><th>发布时间（UTC）</th><th>下载</th></tr>
+        </thead>
+        <tbody>
+          {% for p in publications %}
+            <tr>
+              <td>{{ p['publish_no'] }}</td>
+              <td>{{ p['source_name'] or '—' }}</td>
+              <td>{{ p['entry_count'] }}</td>
+              <td>{{ p['created_at'] }}</td>
+              <td><a href="{{ url_for('main.download', publish_no=p['publish_no']) }}">下载 CSV</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">尚无发布。</p>
+    {% endif %}
+    <form method="get" action="{{ url_for('main.download_lookup') }}">
+      <label>发布号 <input type="text" name="publish_no" required placeholder="例如 GZ-2026-001"></label>
+      <button type="submit">下载 CSV</button>
+    </form>
+  </section>
+</main>
+</body>
+</html>

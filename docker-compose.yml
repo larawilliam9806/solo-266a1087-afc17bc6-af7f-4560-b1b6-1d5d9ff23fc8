@@ -1,0 +1,28 @@
+services:
+  gazetteer:
+    build: .
+    image: gazetteer-archive:latest
+    container_name: gazetteer-archive
+    ports:
+      - "8000:8000"
+    environment:
+      ARCHIVE_DB: /data/archive.sqlite3
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+    volumes:
+      - gazetteer-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  gazetteer-data:

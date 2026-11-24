@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>未找到</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header><h1>未找到</h1></header>
+<main>
+  <section class="card">
+    <p>没有这个发布号对应的对照表。</p>
+    <p><a href="{{ url_for('main.index') }}">返回首页</a></p>
+  </section>
+</main>
+</body>
+</html>
